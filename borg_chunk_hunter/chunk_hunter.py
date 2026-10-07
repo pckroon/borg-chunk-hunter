@@ -1,20 +1,16 @@
 #!/usr/bin/env python3
-import os
+import argparse
+import contextlib
+import functools
 import sys
-from unittest.mock import MagicMock, patch
+import inspect
 
-try:
-    from borg import repository
-    from borg.archive import Archive
-    from borg.cache import LocalCache
-    from borg.repository import Repository, LoggedIO
-    from borg.helpers.errors import IntegrityError
-except ImportError:
-    print("Error: Borg python libraries not found.")
-    raise
+from borg.archive import Archive
+from borg.cache import LocalCache
+from borg.repository import Repository, LoggedIO
+from borg.helpers.errors import IntegrityError
 
 
-# --- 1. THE EXPLICIT SINGLETON REGISTRY ---
 class ChunkRegistry:
     """
     A Singleton registry that tracks requested and missing chunks.
@@ -47,15 +43,10 @@ class GhostKey:
         self._real_key = real_key
 
     def decrypt(self, *args, **kwargs):
-        # The only method we intercept
-        # if args[0] == b'\x00':
-        #     return b'\x00'
-        # Otherwise, delegate to the real key
         try:
             return self._real_key.decrypt(*args, **kwargs)
-        except IntegrityError as e:
+        except (IntegrityError, IndexError) as e:
             return b''
-
 
     def __getattr__(self, name):
         """
@@ -65,35 +56,41 @@ class GhostKey:
         return getattr(self._real_key, name)
 
 
-orig_read = LoggedIO.read
-def phantom_read(self, segment, offset, id):
+def phantom_read(self, segment, offset, id, read_data=True, original=None):
     path = self.segment_filename(segment)
     registry = ChunkRegistry()
     registry.add_requested(path)
     try:
-        return orig_read(self, segment, offset, id)
+        return original(self, segment, offset, id, read_data=read_data)
     except FileNotFoundError as e:
         registry.add_missing(path)
-        mock_chunk = MagicMock()
-        mock_chunk.data = b''
-        mock_chunk.size = 0
-        return mock_chunk
-
-LoggedIO.read = phantom_read
-
-
-def make_wrapper(cls, method_name):
-    original = getattr(cls, method_name)
-    def phantom(self, name):
-        if name == 'key':
-            return GhostKey(original(self, name))
+        if read_data:
+            return b''
         else:
-            return original(self, name)
-    setattr(cls, method_name, phantom)
+            return 0
 
-make_wrapper(Repository, '__getattribute__')
-make_wrapper(Archive, '__getattribute__')
-make_wrapper(LocalCache, '__getattribute__')
+
+def phantom_get(self, name, original):
+    if name == 'key':
+        return GhostKey(original(self, name))
+    else:
+        return original(self, name)
+
+
+def make_wrapper(cls, method_name, new_function):
+    original = getattr(cls, method_name)
+    if inspect.isclass(cls):
+        partial = functools.partialmethod
+    else:
+        partial = functools.partial
+
+    if 'original' in inspect.signature(new_function).parameters:
+        kwargs = {'original': original}
+    else:
+        kwargs = {}
+    phantom = partial(new_function, **kwargs)
+    functools.update_wrapper(phantom, original)
+    setattr(cls, method_name, phantom)
 
 
 # Hijack sys.exit to prevent the CLI from killing the script
@@ -106,45 +103,76 @@ def patched_exit(status=0):
     raise BorgExitException(status)
 
 
-sys.exit = patched_exit
+def install_wrappers():
+    make_wrapper(Repository, '__getattribute__', phantom_get)
+    make_wrapper(Archive, '__getattribute__', phantom_get)
+    make_wrapper(LocalCache, '__getattribute__', phantom_get)
+    make_wrapper(LoggedIO, 'read', phantom_read)
+    make_wrapper(sys, 'exit', patched_exit)
 
 
-# --- 4. THE EXECUTION ---
-def main():
+def build_cli():
+    parser = argparse.ArgumentParser(description="Intercept Borg requests to identify missing chunks.")
+    parser.add_argument("--borg-out", type=str, help="File to capture Borg stdout")
+    parser.add_argument("--borg-err", type=str, help="File to capture Borg stderr")
+    parser.add_argument('--quiet', '-q', action='store_true')
+    return parser
+
+
+def run_borg(argv, stdout=None, stderr=None):
     import borg.archiver
-    # argv = [sys.argv[0]] + sys.argv[1:]
-    # sys.argv = argv
 
-    print(f"[*] Intercepting Borg command: {' '.join(sys.argv[1:])}")
-    print("-" * 60)
+    old_sysargv = sys.argv.copy()
+    sys.argv = argv
+    redirect_stack = contextlib.ExitStack()
 
+    if stdout:
+        out_f = redirect_stack.enter_context(open(stdout, 'w'))
+        redirect_stack.enter_context(contextlib.redirect_stdout(out_f))
+    if stderr:
+        err_f = redirect_stack.enter_context(open(stderr, 'w'))
+        redirect_stack.enter_context(contextlib.redirect_stderr(err_f))
     try:
-        borg.archiver.main()
+        with redirect_stack:
+            borg.archiver.main()
+        exit_code = 0
     except BorgExitException as e:
         exit_code = e.code
     except Exception as e:
-        print(f"\n[!] The Borg CLI crashed unexpectedly: {e}")
         exit_code = 1
 
-    # --- 5. THE REVEAL ---
-    # Retrieve the singleton instance to read the results
+    sys.argv = old_sysargv
+    return exit_code
+
+
+def main():
+    parser = build_cli()
+    args, borg_args = parser.parse_known_args()
+
+    install_wrappers()
+
+    if not args.quiet:
+        print(f"[*] Intercepting Borg command: {' '.join(sys.argv[1:])}")
+        print("-" * 60)
+
+    exit_code = run_borg([sys.argv[0]] + borg_args, args.borg_out, args.borg_err)
+
     registry = ChunkRegistry()
 
-    print("\n" + "=" * 60)
-    print("BORG OMNISCIENCE: RESULTS")
-    print("=" * 60)
-    print(f"Command Status: {'Success' if exit_code == 0 else 'Error/Exit'}")
-    print(f"Total chunks requested: {len(registry.requested)}")
-    print(f"Total chunks missing:   {len(registry.missing)}")
-    print("-" * 60)
+    if not args.quiet:
+        print(f"Command Status: {'Success' if exit_code == 0 else 'Error/Exit'}")
+        print(f"Total chunks requested: {len(registry.requested)}")
+        print(f"Total chunks missing:   {len(registry.missing)}")
+        print("-" * 60)
 
     if registry.missing:
-        print("SHOPPING LIST (Rehydrate these in Azure):")
+        if not args.quiet:
+            print("SHOPPING LIST (Rehydrate these in Azure):")
         for path in sorted(list(registry.missing)):
             print(path)
     else:
-        print("Everything required for this command is already local!")
-    print("=" * 60)
+        if not args.quiet:
+            print("Everything required for this command is already local!")
 
 
 if __name__ == "__main__":
