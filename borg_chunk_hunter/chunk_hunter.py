@@ -84,6 +84,7 @@ def make_wrapper(cls, method_name, new_function):
     phantom = partial(new_function, **kwargs)
     functools.update_wrapper(phantom, original)
     setattr(cls, method_name, phantom)
+    return original
 
 
 # Hijack sys.exit to prevent the CLI from killing the script
@@ -103,10 +104,23 @@ def phantom_manifest_load(*args, original=None, **kwargs):
     return manifest, key
 
 
+@contextlib.contextmanager
 def install_wrappers():
-    make_wrapper(Manifest, 'load', phantom_manifest_load)
-    make_wrapper(LoggedIO, 'read', phantom_read)
-    make_wrapper(sys, 'exit', patched_exit)
+    patches = [
+            (Manifest, 'load', phantom_manifest_load),
+            (LoggedIO, 'read', phantom_read),
+            (sys, 'exit', patched_exit),
+        ]
+    originals = []
+    for cls, method_name, new_func in patches:
+        original = make_wrapper(cls, method_name, new_func)
+        originals.append((cls, method_name, original))
+
+    try:
+        yield
+    finally:
+        for cls, method_name, original in originals:
+            setattr(cls, method_name, original)
 
 
 def build_cli():
@@ -123,6 +137,7 @@ def run_borg(argv, stdout=None, stderr=None):
     old_sysargv = sys.argv.copy()
     sys.argv = argv
     redirect_stack = contextlib.ExitStack()
+    redirect_stack.enter_context(install_wrappers())
 
     if stdout:
         out_f = redirect_stack.enter_context(open(stdout, 'w'))
@@ -147,8 +162,6 @@ def main():
     parser = build_cli()
     args, borg_args = parser.parse_known_args()
 
-    install_wrappers()
-
     exit_code = run_borg([sys.argv[0]] + borg_args, args.borg_out, args.borg_err)
 
     registry = ChunkRegistry()
@@ -160,13 +173,14 @@ def main():
         print(f"Total chunks requested: {len(registry.requested)}")
         print(f"Total chunks missing:   {len(registry.missing)}")
 
+    if args.verbose:
+        print("-" * 60)
+        print("RETRIEVED CHUNKS")
+        print("----------------")
+        for path in sorted(list(registry.requested - registry.missing)):
+            print(path)
+
     if registry.missing:
-        if args.verbose:
-            print("-" * 60)
-            print("RETRIEVED CHUNKS")
-            print("----------------")
-            for path in sorted(list(registry.requested - registry.missing)):
-                print(path)
         if not args.quiet:
             print("-" * 60)
             print("MISSING CHUNKS")
