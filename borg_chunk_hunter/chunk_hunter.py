@@ -5,10 +5,10 @@ import functools
 import sys
 import inspect
 
-from borg.archive import Archive
-from borg.cache import LocalCache
-from borg.repository import Repository, LoggedIO
+from borg.repository import LoggedIO
 from borg.helpers.errors import IntegrityError
+from borg.helpers.manifest import Manifest
+import borg.archiver
 
 
 class ChunkRegistry:
@@ -70,13 +70,6 @@ def phantom_read(self, segment, offset, id, read_data=True, original=None):
             return 0
 
 
-def phantom_get(self, name, original):
-    if name == 'key':
-        return GhostKey(original(self, name))
-    else:
-        return original(self, name)
-
-
 def make_wrapper(cls, method_name, new_function):
     original = getattr(cls, method_name)
     if inspect.isclass(cls):
@@ -103,10 +96,15 @@ def patched_exit(status=0):
     raise BorgExitException(status)
 
 
+def phantom_manifest_load(*args, original=None, **kwargs):
+    manifest, key = original(*args, **kwargs)
+    if key:
+        key = GhostKey(key)
+    return manifest, key
+
+
 def install_wrappers():
-    make_wrapper(Repository, '__getattribute__', phantom_get)
-    make_wrapper(Archive, '__getattribute__', phantom_get)
-    make_wrapper(LocalCache, '__getattribute__', phantom_get)
+    make_wrapper(Manifest, 'load', phantom_manifest_load)
     make_wrapper(LoggedIO, 'read', phantom_read)
     make_wrapper(sys, 'exit', patched_exit)
 
@@ -115,13 +113,13 @@ def build_cli():
     parser = argparse.ArgumentParser(description="Intercept Borg requests to identify missing chunks.")
     parser.add_argument("--borg-out", type=str, help="File to capture Borg stdout")
     parser.add_argument("--borg-err", type=str, help="File to capture Borg stderr")
-    parser.add_argument('--quiet', '-q', action='store_true')
+    verb_group = parser.add_mutually_exclusive_group()
+    verb_group.add_argument('--quiet', '-q', action='store_true', help="Limit output to missing chunks")
+    verb_group.add_argument('--verbose', '-v', action='store_true', help="Also output successfully retrieved chunks")
     return parser
 
 
 def run_borg(argv, stdout=None, stderr=None):
-    import borg.archiver
-
     old_sysargv = sys.argv.copy()
     sys.argv = argv
     redirect_stack = contextlib.ExitStack()
@@ -151,27 +149,33 @@ def main():
 
     install_wrappers()
 
-    if not args.quiet:
-        print(f"[*] Intercepting Borg command: {' '.join(sys.argv[1:])}")
-        print("-" * 60)
-
     exit_code = run_borg([sys.argv[0]] + borg_args, args.borg_out, args.borg_err)
 
     registry = ChunkRegistry()
 
     if not args.quiet:
+        print(f"[*] Intercepted Borg command: {' '.join(sys.argv[1:])}")
+        print("-" * 60)
         print(f"Command Status: {'Success' if exit_code == 0 else 'Error/Exit'}")
         print(f"Total chunks requested: {len(registry.requested)}")
         print(f"Total chunks missing:   {len(registry.missing)}")
-        print("-" * 60)
 
     if registry.missing:
+        if args.verbose:
+            print("-" * 60)
+            print("RETRIEVED CHUNKS")
+            print("----------------")
+            for path in sorted(list(registry.requested - registry.missing)):
+                print(path)
         if not args.quiet:
-            print("SHOPPING LIST (Rehydrate these in Azure):")
+            print("-" * 60)
+            print("MISSING CHUNKS")
+            print("--------------")
         for path in sorted(list(registry.missing)):
             print(path)
     else:
-        if not args.quiet:
+        if not args.quiet and not exit_code:
+            print("-" * 60)
             print("Everything required for this command is already local!")
 
 
